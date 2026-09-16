@@ -1,0 +1,55 @@
+name: Auto Unzip
+
+on:
+  push:
+    paths:
+      - '**.zip'
+  workflow_dispatch:
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and unzip all zip files
+        run: |
+          find . \
+            -name "*.zip" \
+            -not -path "./.git/*" \
+          | while read zipfile; do
+              echo "Unzipping: $zipfile"
+              tmpdir=$(mktemp -d)
+              unzip -o "$zipfile" -d "$tmpdir"
+              rm "$zipfile"
+
+              # Walk into nested folders until we find actual files
+              src="$tmpdir"
+              while [ "$(ls -A "$src" | wc -l)" -eq 1 ] && [ -d "$src/$(ls -A "$src")" ]; do
+                src="$src/$(ls -A "$src")"
+              done
+
+              echo "Extracting from: $src"
+              cp -r "$src/." .
+              rm -rf "$tmpdir"
+              echo "Done"
+            done
+
+      - name: Commit extracted files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+          else
+            git commit -m "auto: unzip and extract files [skip ci]"
+            git push
+          fi
