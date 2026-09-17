@@ -23,6 +23,7 @@ object YdlParser {
                     thumbnail    = obj.optString("thumbnail").ifBlank { null },
                     viewCountStr = obj.optString("view_count_str").ifBlank { null },
                     uploadDate   = obj.optString("upload_date").ifBlank { null },
+                    webpageUrl   = obj.optString("webpage_url").ifBlank { null },
                     formats      = formats,
                 )
             )
@@ -79,7 +80,6 @@ object YdlParser {
             "video-only"  -> FormatType.VIDEO_ONLY
             else          -> FormatType.AUDIO_ONLY
         }
-
         return VideoFormat(
             type          = type,
             quality       = obj.getString("quality"),
