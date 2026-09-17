@@ -3,11 +3,7 @@ package com.ydl.app.models
 import android.os.Parcelable
 import kotlinx.parcelize.Parcelize
 
-enum class FormatType {
-    VIDEO_AUDIO,
-    VIDEO_ONLY,
-    AUDIO_ONLY
-}
+enum class FormatType { VIDEO_AUDIO, VIDEO_ONLY, AUDIO_ONLY }
 
 @Parcelize
 data class VideoFormat(
@@ -34,18 +30,7 @@ data class VideoFormat(
                 else            -> "$it B"
             }
         }
-
-    val badgeVariant: BadgeVariant
-        get() = when {
-            type == FormatType.AUDIO_ONLY -> BadgeVariant.AUDIO
-            (height ?: 0) >= 1080         -> BadgeVariant.HD
-            (height ?: 0) >= 480          -> BadgeVariant.SD
-            (height ?: 0) > 0             -> BadgeVariant.LO
-            else                          -> BadgeVariant.AUDIO
-        }
 }
-
-enum class BadgeVariant { HD, SD, LO, AUDIO }
 
 @Parcelize
 data class VideoInfo(
@@ -55,6 +40,7 @@ data class VideoInfo(
     val thumbnail: String?,
     val viewCountStr: String?,
     val uploadDate: String?,
+    val webpageUrl: String?,
     val formats: List<VideoFormat>,
 ) : Parcelable
 
