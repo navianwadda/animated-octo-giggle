@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -107,9 +108,7 @@ private fun MainContent(
             when (ui) {
                 is UiState.Idle -> FullScreenMessage("Search or paste a URL")
                 is UiState.Loading -> FullScreenMessage("Loading…")
-                is UiState.Error -> {
-                    FullScreenError(message = ui.message, onRetry = onClearError)
-                }
+                is UiState.Error -> FullScreenError(message = ui.message, onRetry = onClearError)
                 is UiState.SearchResults -> SearchResultsList(
                     results = ui.results,
                     onSelect = onLoadUrl,
@@ -188,7 +187,7 @@ private fun SearchResultsList(results: List<SearchResult>, onSelect: (String) ->
                         contentScale = ContentScale.Crop,
                     )
                 },
-                modifier = androidx.compose.foundation.clickable { onSelect(result.url) }
+                modifier = Modifier.clickable { onSelect(result.url) }
             )
             HorizontalDivider()
         }
@@ -202,7 +201,9 @@ private fun VideoDetail(info: VideoInfo, onDownload: (VideoFormat) -> Unit) {
             AsyncImage(
                 model = info.thumbnail,
                 contentDescription = null,
-                modifier = Modifier.fillMaxWidth().height(200.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp),
                 contentScale = ContentScale.Crop,
             )
             Column(modifier = Modifier.padding(16.dp)) {
@@ -229,7 +230,7 @@ private fun FormatRow(format: VideoFormat, onDownload: () -> Unit) {
         headlineContent = { Text(format.quality) },
         supportingContent = {
             val details = buildList {
-                if (format.type != com.ydl.app.models.FormatType.AUDIO_ONLY) add(format.ext.uppercase())
+                if (format.type != FormatType.AUDIO_ONLY) add(format.ext.uppercase())
                 format.fps?.let { add("${it}fps") }
                 format.filesizeLabel?.let { add(it) }
                 if (format.merged) add("needs merge")
@@ -260,7 +261,9 @@ private fun FullScreenMessage(text: String) {
 @Composable
 private fun FullScreenError(message: String, onRetry: () -> Unit) {
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -269,6 +272,3 @@ private fun FullScreenError(message: String, onRetry: () -> Unit) {
         Button(onClick = onRetry) { Text("Retry") }
     }
 }
-
-private fun androidx.compose.foundation.Modifier.clickable(onClick: () -> Unit) =
-    this.then(androidx.compose.foundation.clickable(onClick = onClick))
