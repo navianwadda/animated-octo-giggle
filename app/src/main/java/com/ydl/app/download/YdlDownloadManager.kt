@@ -119,7 +119,7 @@ class YdlDownloadManager(private val context: Context) {
                 null,
                 { stats ->
                     if (stats != null && stats.time > 0) {
-                        val prog = (stats.time / 1000f).coerceIn(0f, 99f) / 100f
+                        val prog = (stats.time.toFloat() / 1000f).coerceIn(0f, 99f) / 100f
                         _state.value = DownloadState.Merging(format.filename, prog)
                     }
                 }
