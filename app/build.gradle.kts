@@ -2,7 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("kotlin-parcelize")
-    id("com.chaquo.python") version "15.0.0"
+    id("com.chaquo.python")
 }
 
 android {
@@ -59,12 +59,6 @@ android {
 
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.13"
-    }
-
-    bundle {
-        abi { enableSplit = true }
-        density { enableSplit = true }
-        language { enableSplit = true }
     }
 }
 
