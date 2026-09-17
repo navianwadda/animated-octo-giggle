@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Environment
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import com.ydl.app.models.ResolvedUrls
 import com.ydl.app.models.VideoFormat
@@ -43,14 +44,14 @@ class YdlDownloadManager(private val context: Context) {
         } else {
             val url = format.directUrl
             if (url.isNullOrBlank()) {
-                _state.value = DownloadState.Failed("No direct URL available for this format")
+                _state.value = DownloadState.Failed("No direct URL available")
                 return
             }
-            enqueueDirectDownload(url, format.filename, format.ext)
+            enqueueDirectDownload(url, format.filename)
         }
     }
 
-    private fun enqueueDirectDownload(url: String, filename: String, ext: String) {
+    private fun enqueueDirectDownload(url: String, filename: String) {
         try {
             val request = DownloadManager.Request(Uri.parse(url)).apply {
                 setTitle(filename)
@@ -65,7 +66,7 @@ class YdlDownloadManager(private val context: Context) {
             val downloadId = dm.enqueue(request)
             _state.value = DownloadState.Enqueued(filename, downloadId)
         } catch (e: Exception) {
-            _state.value = DownloadState.Failed(e.message ?: "Failed to enqueue download")
+            _state.value = DownloadState.Failed(e.message ?: "Enqueue failed")
         }
     }
 
@@ -89,32 +90,41 @@ class YdlDownloadManager(private val context: Context) {
 
         _state.value = DownloadState.Merging(format.filename, 0f)
 
-        var lastProgress = 0f
-
-        val cmd = "-i \"${resolved.videoUrl}\" -i \"${resolved.audioUrl}\" " +
-                  "-c copy -map 0:v:0 -map 1:a:0 " +
-                  "-movflags +faststart " +
-                  "\"${outputFile.absolutePath}\""
+        val cmd = buildString {
+            append("-y ")
+            append("-headers \"User-Agent: Mozilla/5.0\" ")
+            append("-i \"${resolved.videoUrl}\" ")
+            append("-headers \"User-Agent: Mozilla/5.0\" ")
+            append("-i \"${resolved.audioUrl}\" ")
+            append("-c copy -map 0:v:0 -map 1:a:0 ")
+            append("-movflags +faststart ")
+            append("\"${outputFile.absolutePath}\"")
+        }
 
         suspendCancellableCoroutine { cont ->
-            FFmpegKit.executeAsync(
+            val session = FFmpegKit.executeAsync(
                 cmd,
                 { completedSession ->
                     if (ReturnCode.isSuccess(completedSession.returnCode)) {
                         _state.value = DownloadState.Done(format.filename)
                     } else {
-                        _state.value = DownloadState.Failed(
-                            "ffmpeg failed (rc=${completedSession.returnCode})"
-                        )
+                        val log = completedSession.allLogsAsString?.takeLast(300) ?: "unknown error"
+                        _state.value = DownloadState.Failed("Merge failed: $log")
                     }
                     if (cont.isActive) cont.resume(Unit)
                 },
-                { },
-                { _ ->
-                    lastProgress = (lastProgress + 0.5f).coerceAtMost(95f)
-                    _state.value = DownloadState.Merging(format.filename, lastProgress / 100f)
+                null,
+                { stats ->
+                    val progress = stats?.let {
+                        (it.time.toFloat() / 1000f).coerceIn(0f, 95f) / 100f
+                    } ?: 0f
+                    _state.value = DownloadState.Merging(format.filename, progress)
                 }
             )
+
+            cont.invokeOnCancellation {
+                FFmpegKit.cancel(session.sessionId)
+            }
         }
     }
 
