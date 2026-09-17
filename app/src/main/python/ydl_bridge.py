@@ -1,13 +1,7 @@
-# ydl_bridge.py
-# Shared Python bridge for both V1 (bundled) and V2 (auto-update).
-# Called from Kotlin via Chaquopy. Never import this directly —
-# always call through YdlBridge.kt which handles threading and errors.
-
 import json
 import sys
 import os
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _seconds_to_hms(total: int) -> str:
     h = total // 3600
@@ -31,29 +25,24 @@ def _fmt_views(n: int) -> str:
 def _safe_filename(title: str, ext: str) -> str:
     import re
     clean = re.sub(r'[^\w\s\-.]', '_', title)
-    return f"{clean}.{ext}"
+    return f"{clean[:80]}.{ext}"
 
 
-# ── Core extraction ───────────────────────────────────────────────────────────
+def _base_opts():
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 15,
+        "retries": 2,
+    }
+
 
 def extract_info(url: str) -> str:
-    """
-    Extract video metadata and available formats from a URL.
-    Returns JSON string:
-      { title, channel, duration_str, thumbnail, view_count_str,
-        upload_date, formats: [VideoFormat] }
-    or { error: str } on failure.
-    """
     try:
         import yt_dlp
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(_base_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
 
         raw_formats = info.get("formats", [])
@@ -71,7 +60,6 @@ def extract_info(url: str) -> str:
         best_audio = sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)
         best_audio = best_audio[0] if best_audio else None
 
-        # Video + Audio (merged) — one per unique height
         merged = []
         seen_heights = set()
         for v in sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True):
@@ -89,16 +77,20 @@ def extract_info(url: str) -> str:
                 "acodec": best_audio.get("acodec") if best_audio else None,
                 "filesize": None,
                 "format_id": f"{v['format_id']}+{best_audio['format_id'] if best_audio else 'bestaudio'}",
-                "direct_url": None,   # merged formats need ffmpeg; no single URL
+                "direct_url": None,
                 "merged": True,
                 "filename": _safe_filename(info.get("title", "video"), "mp4"),
             })
 
-        # Video only
         video_only = []
+        seen_v = set()
         for v in sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True):
             if v.get("acodec") and v["acodec"] != "none":
                 continue
+            key = f"{v.get('height')}_{v.get('ext')}"
+            if key in seen_v:
+                continue
+            seen_v.add(key)
             video_only.append({
                 "type": "video-only",
                 "quality": f"{v.get('height')}p",
@@ -113,7 +105,6 @@ def extract_info(url: str) -> str:
                 "filename": _safe_filename(info.get("title", "video"), v.get("ext", "mp4")),
             })
 
-        # Audio only
         audio_only = []
         seen_audio = set()
         for a in sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True):
@@ -136,13 +127,25 @@ def extract_info(url: str) -> str:
 
         view_count = info.get("view_count")
 
+        thumbnails = info.get("thumbnails") or []
+        thumbnail = info.get("thumbnail")
+        if thumbnails:
+            best = max(
+                (t for t in thumbnails if t.get("url") and t.get("width")),
+                key=lambda t: t.get("width", 0),
+                default=None,
+            )
+            if best:
+                thumbnail = best["url"]
+
         return json.dumps({
             "title": info.get("title", ""),
             "channel": info.get("channel") or info.get("uploader"),
             "duration_str": _seconds_to_hms(info["duration"]) if info.get("duration") else None,
-            "thumbnail": info.get("thumbnail"),
+            "thumbnail": thumbnail,
             "view_count_str": _fmt_views(view_count) if view_count else None,
             "upload_date": info.get("upload_date"),
+            "webpage_url": info.get("webpage_url") or url,
             "formats": merged + video_only + audio_only,
         })
 
@@ -151,21 +154,12 @@ def extract_info(url: str) -> str:
 
 
 def search_youtube(query: str, max_results: int = 10) -> str:
-    """
-    Search YouTube. Returns JSON string:
-      { results: [SearchResult] } or { error: str }
-    """
     try:
         import yt_dlp
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extract_flat": True,
-        }
+        opts = {**_base_opts(), "extract_flat": "in_playlist"}
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
 
         entries = info.get("entries", [])
@@ -173,15 +167,21 @@ def search_youtube(query: str, max_results: int = 10) -> str:
         for v in entries:
             if not v:
                 continue
+            vid_id = v.get("id", "")
             view_count = v.get("view_count")
+
+            thumbnail = v.get("thumbnail")
+            if not thumbnail and vid_id:
+                thumbnail = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+
             results.append({
-                "id": v.get("id", ""),
-                "url": f"https://www.youtube.com/watch?v={v.get('id', '')}",
+                "id": vid_id,
+                "url": f"https://www.youtube.com/watch?v={vid_id}",
                 "title": v.get("title", ""),
                 "channel": v.get("channel") or v.get("uploader"),
                 "duration_str": _seconds_to_hms(v["duration"]) if v.get("duration") else None,
                 "view_count_str": _fmt_views(view_count) if view_count else None,
-                "thumbnail": v.get("thumbnail"),
+                "thumbnail": thumbnail,
             })
 
         return json.dumps({"results": results})
@@ -191,24 +191,14 @@ def search_youtube(query: str, max_results: int = 10) -> str:
 
 
 def resolve_merged_urls(url: str, format_id: str) -> str:
-    """
-    For a merged (video+audio) format, resolve the two direct URLs
-    so Kotlin can pass them to ffmpeg-kit without re-running yt-dlp.
-    Returns JSON: { video_url, audio_url } or { error }
-    """
     try:
         import yt_dlp
 
         video_fmt_id, audio_fmt_id = format_id.split("+", 1)
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "format": format_id,
-        }
+        opts = {**_base_opts(), "format": format_id}
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         formats = {f["format_id"]: f for f in info.get("formats", [])}
@@ -217,7 +207,6 @@ def resolve_merged_urls(url: str, format_id: str) -> str:
         audio = formats.get(audio_fmt_id)
 
         if not video or not audio:
-            # Fallback: pick best available
             video_formats = [
                 f for f in info.get("formats", [])
                 if f.get("vcodec") and f["vcodec"] != "none" and f.get("height")
@@ -241,7 +230,6 @@ def resolve_merged_urls(url: str, format_id: str) -> str:
 
 
 def get_version() -> str:
-    """Return installed yt-dlp version string."""
     try:
         import yt_dlp
         return yt_dlp.version.__version__
