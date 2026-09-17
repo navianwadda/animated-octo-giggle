@@ -19,13 +19,6 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
-
-        python {
-            version = "3.11"
-            pip {
-                install("yt-dlp")
-            }
-        }
     }
 
     buildTypes {
@@ -59,6 +52,15 @@ android {
 
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.13"
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+        pip {
+            install("yt-dlp")
+        }
     }
 }
 
