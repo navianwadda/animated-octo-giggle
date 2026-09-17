@@ -13,8 +13,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.coroutines.resume
 
 sealed class DownloadState {
     object Idle : DownloadState()
@@ -59,7 +61,6 @@ class YdlDownloadManager(private val context: Context) {
                 setAllowedOverMetered(true)
                 setAllowedOverRoaming(true)
             }
-
             val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             val downloadId = dm.enqueue(request)
             _state.value = DownloadState.Enqueued(filename, downloadId)
@@ -95,27 +96,26 @@ class YdlDownloadManager(private val context: Context) {
                   "-movflags +faststart " +
                   "\"${outputFile.absolutePath}\""
 
-        val session = FFmpegKit.executeAsync(
-            cmd,
-            { completedSession ->
-                if (ReturnCode.isSuccess(completedSession.returnCode)) {
-                    _state.value = DownloadState.Done(format.filename)
-                } else {
-                    val logs = completedSession.allLogsAsString
-                    _state.value = DownloadState.Failed(
-                        "ffmpeg failed (rc=${completedSession.returnCode}): ${logs.takeLast(200)}"
-                    )
+        suspendCancellableCoroutine { cont ->
+            FFmpegKit.executeAsync(
+                cmd,
+                { completedSession ->
+                    if (ReturnCode.isSuccess(completedSession.returnCode)) {
+                        _state.value = DownloadState.Done(format.filename)
+                    } else {
+                        _state.value = DownloadState.Failed(
+                            "ffmpeg failed (rc=${completedSession.returnCode})"
+                        )
+                    }
+                    if (cont.isActive) cont.resume(Unit)
+                },
+                { },
+                { _ ->
+                    lastProgress = (lastProgress + 0.5f).coerceAtMost(95f)
+                    _state.value = DownloadState.Merging(format.filename, lastProgress / 100f)
                 }
-            },
-            { },
-            { _ ->
-                val newProgress = (lastProgress + 0.5f).coerceAtMost(95f)
-                lastProgress = newProgress
-                _state.value = DownloadState.Merging(format.filename, newProgress / 100f)
-            }
-        )
-
-        session.waitUntilCompleted()
+            )
+        }
     }
 
     fun reset() {
