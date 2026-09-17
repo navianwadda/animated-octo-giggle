@@ -65,7 +65,7 @@ chaquopy {
 }
 
 dependencies {
-    implementation("com.arthenica:ffmpeg-kit-full:6.0-2")
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
 
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)
