@@ -92,6 +92,8 @@ object YdlParser {
             filesizeBytes = obj.optLong("filesize").takeIf { it > 0 },
             formatId      = obj.getString("format_id"),
             directUrl     = obj.optString("direct_url").ifBlank { null },
+            // FIX: parse the new preview_url field
+            previewUrl    = obj.optString("preview_url").ifBlank { null },
             merged        = obj.optBoolean("merged", false),
             filename      = obj.getString("filename"),
         )
