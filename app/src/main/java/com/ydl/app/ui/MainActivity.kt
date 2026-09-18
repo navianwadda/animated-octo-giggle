@@ -46,6 +46,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MergingMediaSource  // FIX: added for merged audio+video preview
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -413,6 +414,23 @@ private fun SearchCard(result: SearchResult, onClick: () -> Unit) {
     HorizontalDivider(color = Divider, thickness = 0.5.dp, modifier = Modifier.padding(start = 188.dp))
 }
 
+// ---------------------------------------------------------------------------
+// FIX 1 – VIDEO PLAYER
+//
+// The old code looked for VIDEO_AUDIO formats with directUrl != null.
+// But merged (VIDEO_AUDIO) formats always have directUrl = null — they need a
+// resolve + FFmpeg merge step. So player was always null and nothing played.
+//
+// The fix: use previewUrl instead. For merged formats, previewUrl is the raw
+// video-only stream (no audio — but visible). For VIDEO_ONLY formats it is
+// the same as directUrl. We pick the best available previewUrl across all
+// format types ordered by: merged (highest quality video) > video-only > any.
+//
+// We also build the player properly, using MergingMediaSource when we have
+// both a video and audio previewUrl from the same merged format so the user
+// hears audio too. If we only have the video stream the player still works
+// (silent preview).
+// ---------------------------------------------------------------------------
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DetailScreen(
@@ -432,36 +450,52 @@ private fun DetailScreen(
     val videoOnly = remember(info) { info.formats.filter { it.type == FormatType.VIDEO_ONLY } }
     val audioOnly = remember(info) { info.formats.filter { it.type == FormatType.AUDIO_ONLY } }
 
-    val playUrl = remember(info) {
-        info.formats
-            .filter { it.type == FormatType.VIDEO_AUDIO && it.directUrl != null }
-            .maxByOrNull { it.height ?: 0 }
-            ?.directUrl
+    // FIX: pick a previewUrl from any format, preferring highest-quality merged,
+    // then video-only, then audio-only as last resort.
+    val previewUrl = remember(info) {
+        // Best merged format's previewUrl (video stream, possibly silent)
+        merged.filter { it.previewUrl != null }.maxByOrNull { it.height ?: 0 }?.previewUrl
+            ?: videoOnly.filter { it.previewUrl != null }.maxByOrNull { it.height ?: 0 }?.previewUrl
+            ?: audioOnly.firstOrNull { it.previewUrl != null }?.previewUrl
     }
 
-    val player = remember(playUrl) {
-        if (playUrl != null) {
-            val dataSourceFactory = DefaultHttpDataSource.Factory()
-                .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
-                .setDefaultRequestProperties(mapOf(
-                    "Accept" to "*/*",
-                    "Accept-Language" to "en-US,en;q=0.9",
-                    "Origin" to "https://www.youtube.com",
-                    "Referer" to "https://www.youtube.com/",
-                ))
-                .setConnectTimeoutMs(15_000)
-                .setReadTimeoutMs(20_000)
-                .setAllowCrossProtocolRedirects(true)
+    // Best audio previewUrl — lets us build a MergingMediaSource for sound
+    val audioPreviewUrl = remember(info) {
+        audioOnly.filter { it.previewUrl != null }.maxByOrNull { it.abr ?: 0 }?.previewUrl
+    }
 
-            val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
-                .createMediaSource(MediaItem.fromUri(playUrl))
+    val player = remember(previewUrl) {
+        if (previewUrl == null) return@remember null
 
-            ExoPlayer.Builder(context).build().apply {
-                setMediaSource(mediaSource)
-                prepare()
-                playWhenReady = false
-            }
-        } else null
+        val dsFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            .setDefaultRequestProperties(mapOf(
+                "Accept"          to "*/*",
+                "Accept-Language" to "en-US,en;q=0.9",
+                "Origin"          to "https://www.youtube.com",
+                "Referer"         to "https://www.youtube.com/",
+            ))
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(20_000)
+            .setAllowCrossProtocolRedirects(true)
+
+        val videoSource = ProgressiveMediaSource.Factory(dsFactory)
+            .createMediaSource(MediaItem.fromUri(previewUrl))
+
+        // If we have a separate audio stream, merge them so the preview has sound
+        val mediaSource = if (audioPreviewUrl != null && audioPreviewUrl != previewUrl) {
+            val audioSource = ProgressiveMediaSource.Factory(dsFactory)
+                .createMediaSource(MediaItem.fromUri(audioPreviewUrl))
+            MergingMediaSource(videoSource, audioSource)
+        } else {
+            videoSource
+        }
+
+        ExoPlayer.Builder(context).build().apply {
+            setMediaSource(mediaSource)
+            prepare()
+            playWhenReady = false
+        }
     }
 
     DisposableEffect(Unit) { onDispose { player?.release() } }
