@@ -54,6 +54,7 @@ dependencies {
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
     implementation("androidx.media3:media3-exoplayer:1.3.1")
     implementation("androidx.media3:media3-ui:1.3.1")
+    implementation("androidx.media3:media3-datasource:1.3.1")
 
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)
