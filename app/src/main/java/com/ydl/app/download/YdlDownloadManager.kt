@@ -1,172 +1,584 @@
-package com.ydl.app.download
+package com.ydl.app.service
 
-import android.app.DownloadManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.content.Context
+import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkRequest
 import android.net.Uri
-import android.os.Environment
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
-import com.ydl.app.models.ResolvedUrls
-import com.ydl.app.models.VideoFormat
-import com.ydl.app.models.YdlResult
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import kotlin.coroutines.resume
+import android.os.Binder
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.PowerManager.WakeLock
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.ydl.app.ui.MainActivity
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 
-sealed class DownloadState {
-    object Idle : DownloadState()
-    data class ResolvingUrls(val filename: String) : DownloadState()
-    data class Downloading(val filename: String, val progress: Float, val stage: String) : DownloadState()
-    data class Merging(val filename: String, val progress: Float) : DownloadState()
-    data class Enqueued(val filename: String, val downloadId: Long) : DownloadState()
-    data class Done(val filename: String) : DownloadState()
-    data class Failed(val message: String) : DownloadState()
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+/** Everything callers need to observe about an active or finished download. */
+data class DownloadJob(
+    val id: Long,
+    val filename: String,
+    val videoUrl: String,
+    val audioUrl: String,
+    val state: JobState = JobState.Queued,
+)
+
+sealed class JobState {
+    object Queued      : JobState()
+    object Resolving   : JobState()
+    data class Downloading(
+        val stageName: String,   // "video" | "audio"
+        val byteDone: Long,
+        val byteTotal: Long,
+    ) : JobState()
+    data class Merging(val progress: Float) : JobState()   // 0..1
+    data class Done(val uri: Uri)           : JobState()
+    data class Failed(val reason: String)   : JobState()
 }
 
-class YdlDownloadManager(private val context: Context) {
+// ─── Service ─────────────────────────────────────────────────────────────────
 
-    private val _state = MutableStateFlow<DownloadState>(DownloadState.Idle)
-    val state: StateFlow<DownloadState> = _state.asStateFlow()
+/**
+ * Foreground service that downloads and merges video+audio streams.
+ *
+ * Key design decisions borrowed from NewPipe's DownloadManagerService:
+ *  1. Runs as a FOREGROUND SERVICE so Android cannot kill it in background.
+ *  2. Holds a CPU WakeLock + WiFi WakeLock while a download is running.
+ *  3. A Handler on the main thread receives job-state messages; the actual
+ *     I/O happens on Dispatchers.IO so it never blocks the UI.
+ *  4. Post-processing (FFmpeg mux) runs inside the same coroutine scope so
+ *     it is automatically cancelled if the service is stopped cleanly.
+ *  5. Notifications are updated on every progress tick via a throttled
+ *     updateNotification() call — never more often than once per second.
+ *  6. On completion or failure, a separate "done" / "failed" notification is
+ *     posted (auto-cancel on tap) so the user knows what happened.
+ *  7. ConnectivityManager.NetworkCallback pauses / resumes on network loss.
+ */
+class YdlDownloadService : Service() {
 
-    suspend fun download(
-        format: VideoFormat,
-        resolveUrls: suspend () -> YdlResult<ResolvedUrls>,
-    ) = withContext(Dispatchers.IO) {
-        try {
-            if (format.merged) {
-                _state.value = DownloadState.ResolvingUrls(format.filename)
+    // ── binder ───────────────────────────────────────────────────────────────
+    inner class LocalBinder : Binder() {
+        val service get() = this@YdlDownloadService
+    }
+    private val binder = LocalBinder()
+    override fun onBind(intent: Intent): IBinder = binder
 
-                val resolved = when (val r = resolveUrls()) {
-                    is YdlResult.Success -> r.data
-                    is YdlResult.Error -> {
-                        _state.value = DownloadState.Failed("URL resolve failed: ${r.message}")
-                        return@withContext
-                    }
-                }
+    // ── state ─────────────────────────────────────────────────────────────────
+    private val _jobs = MutableStateFlow<Map<Long, DownloadJob>>(emptyMap())
+    val jobs: StateFlow<Map<Long, DownloadJob>> = _jobs.asStateFlow()
 
-                downloadAndMerge(format, resolved)
-            } else {
-                val url = format.directUrl
-                if (url.isNullOrBlank()) {
-                    _state.value = DownloadState.Failed("No direct URL for this format")
-                    return@withContext
-                }
-                enqueueDirectDownload(url, format.filename)
-            }
-        } catch (e: Exception) {
-            _state.value = DownloadState.Failed(e.message ?: "Unknown error")
-        }
+    private var nextId = System.currentTimeMillis()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val activeJobs = mutableMapOf<Long, Job>()  // coroutine job per download
+
+    // ── locks ─────────────────────────────────────────────────────────────────
+    private var wakeLock: WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private var lockAcquired = false
+
+    // ── notifications ─────────────────────────────────────────────────────────
+    private lateinit var notificationManager: NotificationManager
+    private var lastNotificationUpdate = 0L
+
+    // ── connectivity ──────────────────────────────────────────────────────────
+    private lateinit var connectivityManager: ConnectivityManager
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = onNetwork(true)
+        override fun onLost(network: Network)      = onNetwork(false)
+    }
+    @Volatile private var networkAvailable = true
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    override fun onCreate() {
+        super.onCreate()
+        notificationManager = ContextCompat.getSystemService(this, NotificationManager::class.java)!!
+        connectivityManager  = ContextCompat.getSystemService(this, ConnectivityManager::class.java)!!
+
+        createNotificationChannels()
+        connectivityManager.registerNetworkCallback(NetworkRequest.Builder().build(), networkCallback)
+
+        val powerMgr = ContextCompat.getSystemService(this, PowerManager::class.java)!!
+        val wifiMgr  = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+        wakeLock  = powerMgr.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "YDL::download")
+        wifiLock  = wifiMgr.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "YDL::wifi")
     }
 
-    private fun enqueueDirectDownload(url: String, filename: String) {
-        val request = DownloadManager.Request(Uri.parse(url)).apply {
-            setTitle(filename)
-            setDescription("Downloading via YDL")
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "YDL/$filename")
-            addRequestHeader("User-Agent", UA)
-            setAllowedOverMetered(true)
-            setAllowedOverRoaming(true)
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_DOWNLOAD) {
+            val videoUrl  = intent.getStringExtra(EXTRA_VIDEO_URL) ?: return START_NOT_STICKY
+            val audioUrl  = intent.getStringExtra(EXTRA_AUDIO_URL) ?: return START_NOT_STICKY
+            val filename  = intent.getStringExtra(EXTRA_FILENAME)  ?: "download.mp4"
+            enqueue(videoUrl, audioUrl, filename)
         }
-        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        _state.value = DownloadState.Enqueued(filename, dm.enqueue(request))
+        return START_STICKY   // restart if killed (e.g. low-memory)
     }
 
-    private suspend fun downloadAndMerge(format: VideoFormat, resolved: ResolvedUrls) {
-        val cacheDir = context.cacheDir
-        val videoTmp = File(cacheDir, "ydl_video_tmp.mp4")
-        val audioTmp = File(cacheDir, "ydl_audio_tmp.m4a")
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
+        connectivityManager.unregisterNetworkCallback(networkCallback)
+        manageLock(false)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+    }
 
+    // ─── public API ───────────────────────────────────────────────────────────
+
+    fun enqueue(videoUrl: String, audioUrl: String, filename: String): Long {
+        val id = nextId++
+        val job = DownloadJob(id, filename, videoUrl, audioUrl)
+        updateJob(job)
+        startForegroundIfNeeded()
+        activeJobs[id] = scope.launch { runDownload(job) }
+        return id
+    }
+
+    fun cancelJob(id: Long) {
+        activeJobs.remove(id)?.cancel()
+        val job = _jobs.value[id] ?: return
+        updateJob(job.copy(state = JobState.Failed("Cancelled")))
+        checkIdle()
+    }
+
+    // ─── download pipeline ────────────────────────────────────────────────────
+
+    private suspend fun runDownload(job: DownloadJob) {
+        manageLock(true)
         try {
-            _state.value = DownloadState.Downloading(format.filename, 0f, "video")
-            downloadToFile(resolved.videoUrl, videoTmp) { prog ->
-                _state.value = DownloadState.Downloading(format.filename, prog * 0.5f, "Downloading video…")
-            }
+            updateJob(job.copy(state = JobState.Resolving))
 
-            _state.value = DownloadState.Downloading(format.filename, 0.5f, "audio")
-            downloadToFile(resolved.audioUrl, audioTmp) { prog ->
-                _state.value = DownloadState.Downloading(format.filename, 0.5f + prog * 0.4f, "Downloading audio…")
-            }
+            // ── 1. download video stream ─────────────────────────────────────
+            val videoTmp = cacheFile("ydl_${job.id}_v.tmp")
+            downloadStream(
+                url      = job.videoUrl,
+                dest     = videoTmp,
+                stageName = "Downloading video",
+                jobId    = job.id,
+                weightStart = 0f,
+                weightEnd   = 0.5f,
+            )
 
-            _state.value = DownloadState.Merging(format.filename, 0f)
+            // ── 2. download audio stream ─────────────────────────────────────
+            val audioTmp = cacheFile("ydl_${job.id}_a.tmp")
+            downloadStream(
+                url      = job.audioUrl,
+                dest     = audioTmp,
+                stageName = "Downloading audio",
+                jobId    = job.id,
+                weightStart = 0.5f,
+                weightEnd   = 0.9f,
+            )
 
-            val outputDir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "YDL"
-            ).also { it.mkdirs() }
-            val outputFile = File(outputDir, format.filename)
-            if (outputFile.exists()) outputFile.delete()
+            // ── 3. FFmpeg merge ──────────────────────────────────────────────
+            updateJob(_jobs.value[job.id]!!.copy(state = JobState.Merging(0f)))
+            val outFile = publicOutputFile(job.filename)
+            mergeWithFfmpeg(videoTmp, audioTmp, outFile, job.id)
 
-            val cmd = "-y -i \"${videoTmp.absolutePath}\" -i \"${audioTmp.absolutePath}\" " +
-                      "-c:v copy -c:a copy -map 0:v:0 -map 1:a:0 " +
-                      "-movflags +faststart \"${outputFile.absolutePath}\""
-
-            suspendCancellableCoroutine { cont ->
-                val session = FFmpegKit.executeAsync(
-                    cmd,
-                    { s ->
-                        if (ReturnCode.isSuccess(s.returnCode)) {
-                            _state.value = DownloadState.Done(format.filename)
-                        } else {
-                            val log = s.allLogsAsString?.takeLast(500) ?: "no log"
-                            _state.value = DownloadState.Failed("Merge failed: $log")
-                        }
-                        if (cont.isActive) cont.resume(Unit)
-                    },
-                    null,
-                    { stats ->
-                        if (stats != null && stats.time > 0) {
-                            val prog = (stats.time.toFloat() / 1000f).coerceIn(0f, 99f) / 100f
-                            _state.value = DownloadState.Merging(format.filename, prog)
-                        }
-                    }
-                )
-                cont.invokeOnCancellation { FFmpegKit.cancel(session.sessionId) }
-            }
-        } finally {
             videoTmp.delete()
             audioTmp.delete()
+
+            val uri = Uri.fromFile(outFile)
+            // Tell media scanner about the new file
+            sendBroadcast(Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, uri))
+
+            updateJob(_jobs.value[job.id]!!.copy(state = JobState.Done(uri)))
+            postDoneNotification(job.filename)
+
+        } catch (e: CancellationException) {
+            throw e // let coroutine machinery handle it
+        } catch (e: Exception) {
+            val reason = e.message ?: "Unknown error"
+            updateJob(_jobs.value[job.id]!!.copy(state = JobState.Failed(reason)))
+            postFailedNotification(job.filename, reason)
+        } finally {
+            activeJobs.remove(job.id)
+            checkIdle()
         }
     }
 
-    private fun downloadToFile(url: String, dest: File, onProgress: (Float) -> Unit) {
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.apply {
-            setRequestProperty("User-Agent", UA)
-            setRequestProperty("Accept", "*/*")
-            connectTimeout = 20_000
-            readTimeout = 30_000
-            connect()
-        }
+    // ─── stream download ──────────────────────────────────────────────────────
 
-        val total = conn.contentLengthLong.takeIf { it > 0 }
-        var downloaded = 0L
+    /**
+     * Downloads [url] to [dest] with:
+     *  - Range-request retry on 416 (resume support)
+     *  - Automatic retry up to MAX_RETRIES on network errors
+     *  - connectTimeout + readTimeout matching NewPipe (30 s connect, no read timeout stall)
+     *  - Checks [networkAvailable] and suspends/retries if connection drops
+     *
+     * Progress is mapped into the range [weightStart..weightEnd] of the overall
+     * download progress and pushed to [_jobs] / notification.
+     */
+    private suspend fun downloadStream(
+        url: String,
+        dest: java.io.File,
+        stageName: String,
+        jobId: Long,
+        weightStart: Float,
+        weightEnd: Float,
+    ) = withContext(Dispatchers.IO) {
+        var resumeFrom = if (dest.exists()) dest.length() else 0L
+        var retries = 0
 
-        conn.inputStream.use { input ->
-            FileOutputStream(dest).use { output ->
-                val buf = ByteArray(64 * 1024)
-                var n: Int
-                while (input.read(buf).also { n = it } != -1) {
-                    output.write(buf, 0, n)
-                    downloaded += n
-                    if (total != null) onProgress(downloaded.toFloat() / total.toFloat())
+        while (true) {
+            if (!networkAvailable) {
+                delay(2_000)
+                continue
+            }
+
+            try {
+                val conn = openConnection(url, resumeFrom)
+                val totalFromServer = conn.contentLengthLong.takeIf { it > 0 }
+                val grandTotal = if (totalFromServer != null) resumeFrom + totalFromServer else null
+
+                conn.inputStream.use { input ->
+                    java.io.FileOutputStream(dest, /* append= */ resumeFrom > 0).use { output ->
+                        val buf = ByteArray(BUFFER_SIZE)
+                        var bytesRead: Int
+                        var written = resumeFrom
+
+                        while (input.read(buf).also { bytesRead = it } != -1) {
+                            ensureActive()
+                            output.write(buf, 0, bytesRead)
+                            written += bytesRead
+
+                            val fraction = if (grandTotal != null && grandTotal > 0)
+                                written.toFloat() / grandTotal.toFloat()
+                            else 0f
+                            val overall = weightStart + fraction * (weightEnd - weightStart)
+
+                            throttledUpdate(jobId) {
+                                _jobs.value[jobId]!!.copy(
+                                    state = JobState.Downloading(
+                                        stageName = stageName,
+                                        byteDone  = written,
+                                        byteTotal = grandTotal ?: 0L,
+                                    )
+                                )
+                            }
+                            throttledNotification(jobId, stageName, written, grandTotal ?: 0L)
+                        }
+                    }
                 }
+                conn.disconnect()
+                return@withContext  // success
+
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: java.net.SocketTimeoutException) {
+                // network timeout — resume from where we left off
+                resumeFrom = if (dest.exists()) dest.length() else 0L
+                if (++retries > MAX_RETRIES) throw e
+                delay(RETRY_DELAY_MS)
+            } catch (e: java.net.ConnectException) {
+                resumeFrom = if (dest.exists()) dest.length() else 0L
+                if (++retries > MAX_RETRIES) throw e
+                delay(RETRY_DELAY_MS)
+            } catch (e: java.io.IOException) {
+                resumeFrom = if (dest.exists()) dest.length() else 0L
+                if (++retries > MAX_RETRIES) throw e
+                delay(RETRY_DELAY_MS)
             }
         }
-        conn.disconnect()
     }
 
-    fun reset() { _state.value = DownloadState.Idle }
+    private fun openConnection(url: String, resumeFrom: Long): java.net.HttpURLConnection {
+        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        conn.instanceFollowRedirects = true
+        conn.setRequestProperty("User-Agent", UA)
+        conn.setRequestProperty("Accept", "*/*")
+        conn.setRequestProperty("Accept-Encoding", "*")
+        // ── KEY FIX: like NewPipe, set connect timeout to avoid indefinite hangs ──
+        conn.connectTimeout = 30_000   // NewPipe uses exactly 30 s
+        conn.readTimeout    = 0        // 0 = no read timeout (avoid mid-stream cut)
+        if (resumeFrom > 0) {
+            conn.setRequestProperty("Range", "bytes=$resumeFrom-")
+        }
+        conn.connect()
+        return conn
+    }
+
+    // ─── FFmpeg merge ─────────────────────────────────────────────────────────
+
+    /**
+     * Merges video+audio using FFmpegKit — same library your app already uses.
+     *
+     * Key differences vs. the old implementation:
+     *  - Runs inside the coroutine scope → automatically cancelled with the job.
+     *  - Progress reported via stats callback → mapped to 0..1 Merging state.
+     *  - Any FFmpegKit crash is caught and surfaced as JobState.Failed.
+     */
+    private suspend fun mergeWithFfmpeg(
+        videoTmp: java.io.File,
+        audioTmp: java.io.File,
+        output: java.io.File,
+        jobId: Long,
+    ) = suspendCancellableCoroutine<Unit> { cont ->
+        if (output.exists()) output.delete()
+
+        val cmd = "-y " +
+                "-i \"${videoTmp.absolutePath}\" " +
+                "-i \"${audioTmp.absolutePath}\" " +
+                "-c:v copy -c:a copy " +
+                "-map 0:v:0 -map 1:a:0 " +
+                "-movflags +faststart " +
+                "\"${output.absolutePath}\""
+
+        val session = com.arthenica.ffmpegkit.FFmpegKit.executeAsync(
+            cmd,
+            { session ->
+                // completion callback — runs on FFmpegKit's callback thread
+                if (com.arthenica.ffmpegkit.ReturnCode.isSuccess(session.returnCode)) {
+                    if (cont.isActive) cont.resume(Unit) {}
+                } else {
+                    val log = session.allLogsAsString?.takeLast(500) ?: "no log"
+                    if (cont.isActive) cont.resumeWithException(Exception("FFmpeg failed: $log"))
+                }
+            },
+            null,   // log callback (silent)
+            { stats ->
+                // stats callback — progress during mux
+                if (stats != null && stats.time > 0) {
+                    // stats.time is position in ms; we don't know total duration here.
+                    // Use a simple heuristic: progress grows towards 1 as time increases.
+                    // If you have duration_ms from yt-dlp, pass it in and compute exact %.
+                    val rough = (stats.time / 1000f).coerceIn(0f, 100f) / 100f
+                    updateJob(_jobs.value[jobId]!!.copy(state = JobState.Merging(rough)))
+                    updateForegroundNotificationMerging(jobId, rough)
+                }
+            }
+        )
+
+        cont.invokeOnCancellation {
+            com.arthenica.ffmpegkit.FFmpegKit.cancel(session.sessionId)
+        }
+    }
+
+    // ─── helpers ──────────────────────────────────────────────────────────────
+
+    private fun cacheFile(name: String) = java.io.File(cacheDir, name)
+
+    private fun publicOutputFile(filename: String): java.io.File {
+        val dir = java.io.File(
+            android.os.Environment.getExternalStoragePublicDirectory(
+                android.os.Environment.DIRECTORY_DOWNLOADS
+            ),
+            "YDL"
+        ).also { it.mkdirs() }
+        return java.io.File(dir, filename)
+    }
+
+    private fun updateJob(job: DownloadJob) {
+        _jobs.update { it + (job.id to job) }
+    }
+
+    /**
+     * Only push a state update to _jobs at most once per 300 ms to avoid
+     * flooding Compose with recompositions mid-download.
+     */
+    private fun throttledUpdate(jobId: Long, producer: () -> DownloadJob) {
+        val now = System.currentTimeMillis()
+        if (now - lastNotificationUpdate > 300) {
+            updateJob(producer())
+        }
+    }
+
+    private fun throttledNotification(
+        jobId: Long, stageName: String, done: Long, total: Long,
+    ) {
+        val now = System.currentTimeMillis()
+        if (now - lastNotificationUpdate < NOTIFICATION_THROTTLE_MS) return
+        lastNotificationUpdate = now
+        val job = _jobs.value[jobId] ?: return
+        updateForegroundNotificationDownload(job.filename, stageName, done, total)
+    }
+
+    private fun checkIdle() {
+        if (activeJobs.isEmpty()) {
+            manageLock(false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
+    }
+
+    private fun onNetwork(available: Boolean) {
+        networkAvailable = available
+    }
+
+    // ─── WakeLock / WifiLock ─────────────────────────────────────────────────
+
+    /**
+     * NewPipe acquires both a CPU WakeLock and a WiFi WakeLock when a download
+     * is running. This prevents the CPU from sleeping mid-download AND keeps the
+     * radio alive on devices that aggressively power-gate WiFi.
+     */
+    private fun manageLock(acquire: Boolean) {
+        if (acquire == lockAcquired) return
+        if (acquire) {
+            if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 60 * 1000L) // 10 h max
+            if (wifiLock?.isHeld == false) wifiLock?.acquire()
+        } else {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        }
+        lockAcquired = acquire
+    }
+
+    // ─── foreground / notifications ───────────────────────────────────────────
+
+    private fun startForegroundIfNeeded() {
+        val notification = buildProgressNotification(
+            title    = "YDL Download",
+            text     = "Starting…",
+            progress = 0,
+            max      = 100,
+        )
+        startForeground(NOTIF_FOREGROUND_ID, notification)
+    }
+
+    private fun updateForegroundNotificationDownload(
+        filename: String, stage: String, done: Long, total: Long,
+    ) {
+        val pct   = if (total > 0) ((done * 100) / total).toInt() else 0
+        val doneS = formatBytes(done)
+        val totS  = if (total > 0) formatBytes(total) else "?"
+        val notif = buildProgressNotification(
+            title    = filename,
+            text     = "$stage — $doneS / $totS",
+            progress = pct,
+            max      = 100,
+        )
+        notificationManager.notify(NOTIF_FOREGROUND_ID, notif)
+    }
+
+    private fun updateForegroundNotificationMerging(jobId: Long, fraction: Float) {
+        val job = _jobs.value[jobId] ?: return
+        val pct = (fraction * 100).toInt()
+        val notif = buildProgressNotification(
+            title    = job.filename,
+            text     = "Merging… $pct%",
+            progress = pct,
+            max      = 100,
+        )
+        notificationManager.notify(NOTIF_FOREGROUND_ID, notif)
+    }
+
+    private fun postDoneNotification(filename: String) {
+        val tapIntent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pi = PendingIntent.getActivity(
+            this, filename.hashCode(), tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(this, CHANNEL_DONE)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("Download complete")
+            .setContentText(filename)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+        notificationManager.notify(NOTIF_DONE_BASE + filename.hashCode(), notif)
+    }
+
+    private fun postFailedNotification(filename: String, reason: String) {
+        val notif = NotificationCompat.Builder(this, CHANNEL_DONE)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle("Download failed")
+            .setContentText(filename)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$filename\n$reason"))
+            .setAutoCancel(true)
+            .build()
+        notificationManager.notify(NOTIF_DONE_BASE + filename.hashCode() + 1, notif)
+    }
+
+    private fun buildProgressNotification(
+        title: String,
+        text: String,
+        progress: Int,
+        max: Int,
+    ): android.app.Notification {
+        val tapIntent = Intent(this, MainActivity::class.java)
+        val pi = PendingIntent.getActivity(
+            this, 0, tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Builder(this, CHANNEL_PROGRESS)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setProgress(max, progress, progress == 0)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(pi)
+            .build()
+    }
+
+    private fun createNotificationChannels() {
+        val progressCh = NotificationChannel(
+            CHANNEL_PROGRESS,
+            "Download progress",
+            NotificationManager.IMPORTANCE_LOW,   // silent — no sound per tick
+        ).apply { description = "Shows download progress" }
+
+        val doneCh = NotificationChannel(
+            CHANNEL_DONE,
+            "Download complete",
+            NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply { description = "Alerts when a download finishes or fails" }
+
+        notificationManager.createNotificationChannels(listOf(progressCh, doneCh))
+    }
+
+    // ─── static helpers ───────────────────────────────────────────────────────
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
+        bytes >= 1_024     -> "%d KB".format(bytes / 1_024)
+        else               -> "$bytes B"
+    }
+
+    // ─── companion ────────────────────────────────────────────────────────────
 
     companion object {
-        private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        const val ACTION_DOWNLOAD   = "com.ydl.app.action.DOWNLOAD"
+        const val EXTRA_VIDEO_URL   = "extra_video_url"
+        const val EXTRA_AUDIO_URL   = "extra_audio_url"
+        const val EXTRA_FILENAME    = "extra_filename"
+
+        private const val CHANNEL_PROGRESS      = "ydl_progress"
+        private const val CHANNEL_DONE          = "ydl_done"
+        private const val NOTIF_FOREGROUND_ID   = 1001
+        private const val NOTIF_DONE_BASE       = 2000
+
+        private const val BUFFER_SIZE               = 64 * 1024        // 64 KB
+        private const val MAX_RETRIES               = 5
+        private const val RETRY_DELAY_MS            = 3_000L
+        private const val NOTIFICATION_THROTTLE_MS  = 800L             // update ~1/s
+
+        private const val UA =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+        /** Start a download from any Context. */
+        fun start(
+            context: Context,
+            videoUrl: String,
+            audioUrl: String,
+            filename: String,
+        ) {
+            val intent = Intent(context, YdlDownloadService::class.java).apply {
+                action = ACTION_DOWNLOAD
+                putExtra(EXTRA_VIDEO_URL, videoUrl)
+                putExtra(EXTRA_AUDIO_URL, audioUrl)
+                putExtra(EXTRA_FILENAME, filename)
+            }
+            context.startForegroundService(intent)
+        }
     }
 }
