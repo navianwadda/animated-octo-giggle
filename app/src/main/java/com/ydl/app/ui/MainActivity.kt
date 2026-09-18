@@ -1,3 +1,4 @@
+@file:OptIn(androidx.media3.common.util.UnstableApi::class)
 package com.ydl.app.ui
 
 import android.content.Intent
@@ -42,7 +43,10 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.ydl.app.download.DownloadState
@@ -437,9 +441,25 @@ private fun DetailScreen(
 
     val player = remember(playUrl) {
         if (playUrl != null) {
+            val dataSourceFactory = DefaultHttpDataSource.Factory()
+                .setUserAgent("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+                .setDefaultRequestProperties(mapOf(
+                    "Accept" to "*/*",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Origin" to "https://www.youtube.com",
+                    "Referer" to "https://www.youtube.com/",
+                ))
+                .setConnectTimeoutMs(15_000)
+                .setReadTimeoutMs(20_000)
+                .setAllowCrossProtocolRedirects(true)
+
+            val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+                .createMediaSource(MediaItem.fromUri(playUrl))
+
             ExoPlayer.Builder(context).build().apply {
-                setMediaItem(MediaItem.fromUri(playUrl))
+                setMediaSource(mediaSource)
                 prepare()
+                playWhenReady = false
             }
         } else null
     }
@@ -644,6 +664,7 @@ private fun DownloadProgressCard(state: DownloadState, onDismiss: () -> Unit) {
     val (icon, title, subtitle, color, showProgress, progress) = when (state) {
         is DownloadState.Idle          -> return
         is DownloadState.ResolvingUrls -> Tuple6(Icons.Default.CloudSync,     "Resolving streams",  state.filename, AccentBlue, false, 0f)
+        is DownloadState.Downloading   -> Tuple6(Icons.Default.CloudDownload, state.stage,          "${(state.progress * 100).toInt()}%", AccentBlue, true, state.progress)
         is DownloadState.Merging       -> Tuple6(Icons.Default.MergeType,     "Merging video",      "${(state.progress * 100).toInt()}% · ${state.filename}", Color(0xFFBF5AF2), true, state.progress)
         is DownloadState.Enqueued      -> Tuple6(Icons.Default.CloudDownload, "Downloading",        state.filename, TabGreen, false, 0f)
         is DownloadState.Done          -> Tuple6(Icons.Default.CheckCircle,   "Download complete",  state.filename, TabGreen, false, 1f)
@@ -651,6 +672,7 @@ private fun DownloadProgressCard(state: DownloadState, onDismiss: () -> Unit) {
     }
 
     val isDismissible = state is DownloadState.Done || state is DownloadState.Failed
+    val isIndeterminate = state is DownloadState.ResolvingUrls || state is DownloadState.Enqueued
 
     Card(
         modifier = Modifier
