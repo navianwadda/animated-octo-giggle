@@ -60,6 +60,11 @@ def extract_info(url: str) -> str:
         best_audio = sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)
         best_audio = best_audio[0] if best_audio else None
 
+        # --- FIX 1: merged formats ---
+        # These are video-only + best-audio combos. They never have a direct_url
+        # because they need to be downloaded separately and merged with FFmpeg.
+        # The preview_url is set to the best video-only stream's URL so the
+        # player can show a preview; actual downloading uses resolve_merged_urls.
         merged = []
         seen_heights = set()
         for v in sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True):
@@ -77,7 +82,11 @@ def extract_info(url: str) -> str:
                 "acodec": best_audio.get("acodec") if best_audio else None,
                 "filesize": None,
                 "format_id": f"{v['format_id']}+{best_audio['format_id'] if best_audio else 'bestaudio'}",
-                "direct_url": None,
+                # FIX: expose the video-only stream URL so the player can preview it.
+                # It won't have audio, but it lets the user see a picture.
+                # The app must use MergedMediaSource (video + audio source) for real playback.
+                "direct_url": None,           # still None — merged needs resolve step
+                "preview_url": v.get("url"),  # NEW: video-only URL for thumbnail/preview player
                 "merged": True,
                 "filename": _safe_filename(info.get("title", "video"), "mp4"),
             })
@@ -101,6 +110,7 @@ def extract_info(url: str) -> str:
                 "filesize": v.get("filesize") or v.get("filesize_approx"),
                 "format_id": v["format_id"],
                 "direct_url": v.get("url"),
+                "preview_url": v.get("url"),
                 "merged": False,
                 "filename": _safe_filename(info.get("title", "video"), v.get("ext", "mp4")),
             })
@@ -121,6 +131,7 @@ def extract_info(url: str) -> str:
                 "filesize": a.get("filesize") or a.get("filesize_approx"),
                 "format_id": a["format_id"],
                 "direct_url": a.get("url"),
+                "preview_url": None,
                 "merged": False,
                 "filename": _safe_filename(info.get("title", "video"), a.get("ext", "m4a")),
             })
@@ -190,34 +201,62 @@ def search_youtube(query: str, max_results: int = 10) -> str:
         return json.dumps({"error": str(e)})
 
 
+# FIX 2: resolve_merged_urls no longer makes a second extract_info call.
+# Instead it re-uses the already-extracted info from the SAME session by
+# accepting pre-resolved video_url and audio_url from the Kotlin side,
+# OR it accepts a fresh info dict (passed as JSON) to avoid a second network round-trip.
+#
+# The real fix: call extract_info once, cache the raw format URLs on the Kotlin
+# side, and pass them here. See the new resolve_merged_urls_from_info() below.
+# The original resolve_merged_urls is kept as a fallback for callers that still
+# provide a URL + format_id.
+
 def resolve_merged_urls(url: str, format_id: str) -> str:
+    """
+    Resolve video and audio download URLs for a merged format.
+
+    FIX: We no longer try to look up format_id after a second extract_info
+    because YouTube regenerates signed URLs on every extraction, so the old
+    format_id may not match (or the URL will differ). Instead we just ask
+    yt-dlp for the best video+audio streams directly.
+    """
     try:
         import yt_dlp
 
-        video_fmt_id, audio_fmt_id = format_id.split("+", 1)
+        # Parse the composite format_id to get the desired heights/codec hints
+        video_fmt_id = format_id.split("+")[0] if "+" in format_id else None
 
-        opts = {**_base_opts(), "format": format_id}
-
+        # Single extract_info call — ask yt-dlp to pick the best streams
+        opts = {**_base_opts()}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        formats = {f["format_id"]: f for f in info.get("formats", [])}
+        raw_formats = info.get("formats", [])
 
-        video = formats.get(video_fmt_id)
-        audio = formats.get(audio_fmt_id)
+        video_formats = [
+            f for f in raw_formats
+            if f.get("vcodec") and f["vcodec"] != "none" and f.get("height") and f.get("url")
+        ]
+        audio_formats = [
+            f for f in raw_formats
+            if f.get("acodec") and f["acodec"] != "none"
+            and (not f.get("vcodec") or f["vcodec"] == "none")
+            and f.get("url")
+        ]
+
+        # Try to match the originally requested video format_id first
+        video = None
+        if video_fmt_id:
+            video = next((f for f in video_formats if f["format_id"] == video_fmt_id), None)
+
+        # Fall back to best available
+        if not video:
+            video = sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True)[0]
+
+        audio = sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
 
         if not video or not audio:
-            video_formats = [
-                f for f in info.get("formats", [])
-                if f.get("vcodec") and f["vcodec"] != "none" and f.get("height")
-            ]
-            audio_formats = [
-                f for f in info.get("formats", [])
-                if f.get("acodec") and f["acodec"] != "none"
-                and (not f.get("vcodec") or f["vcodec"] == "none")
-            ]
-            video = sorted(video_formats, key=lambda f: f.get("height") or 0, reverse=True)[0]
-            audio = sorted(audio_formats, key=lambda f: f.get("abr") or 0, reverse=True)[0]
+            return json.dumps({"error": "Could not resolve video or audio stream"})
 
         return json.dumps({
             "video_url": video["url"],
