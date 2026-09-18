@@ -18,6 +18,11 @@ data class VideoFormat(
     val filesizeBytes: Long?,
     val formatId: String,
     val directUrl: String?,
+    // FIX: previewUrl is the raw video-only stream URL used for in-app preview.
+    // For VIDEO_AUDIO (merged) formats, directUrl is null (needs resolve+merge),
+    // but previewUrl gives a playable video stream (no audio) for the player preview.
+    // For VIDEO_ONLY / AUDIO_ONLY, previewUrl == directUrl.
+    val previewUrl: String?,
     val merged: Boolean,
     val filename: String,
 ) : Parcelable {
